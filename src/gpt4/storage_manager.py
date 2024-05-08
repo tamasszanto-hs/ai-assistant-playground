@@ -1,8 +1,7 @@
 import boto3
 from botocore.exceptions import ClientError
 import logging
-from threading import Thread
-from queue import Queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Setting up logging
 logging.basicConfig(level=logging.INFO)
@@ -27,47 +26,54 @@ class StorageManager:
         self.table = self.dynamodb.Table(table_name)
 
     def store_items(self, items):
-        """Uses threading to efficiently check and write items."""
-        # Split work into chunks for threading
-        chunk_size = 25  # DynamoDB batch write limit
-        chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
-        threads = []
-        queue = Queue()
+        """Uses ThreadPoolExecutor to efficiently check and write items."""
+        # Retrieve all existing IDs to minimize writes
+        existing_ids = self._get_existing_ids([item['id'] for item in items])
 
-        for chunk in chunks:
-            thread = Thread(target=self._process_chunk, args=(chunk, queue))
-            threads.append(thread)
-            thread.start()
+        # Filter items not in existing_ids
+        new_items = [item for item in items if item['id'] not in existing_ids]
 
-        for thread in threads:
-            thread.join()
-
-        new_items = []
-        while not queue.empty():
-            new_items.extend(queue.get())
-
-        # Write new items in batches
+        # Use ThreadPoolExecutor to perform batch writes
         self._batch_write(new_items)
 
-    def _process_chunk(self, chunk, queue):
-        """Thread worker for processing a chunk of items."""
-        existing_ids = self._get_existing_ids([item['id'] for item in chunk])
-        new_items = [item for item in chunk if item['id'] not in existing_ids]
-        queue.put(new_items)
-
     def _get_existing_ids(self, ids):
+        """Retrieve existing item IDs using concurrent threads."""
         existing_ids = set()
-        for id in ids:
-            response = self.table.get_item(Key={'id': id})
-            if 'Item' in response:
-                existing_ids.add(id)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(self._check_id_existence, id): id for id in ids}
+            for future in as_completed(futures):
+                id, exists = future.result()
+                if exists:
+                    existing_ids.add(id)
         return existing_ids
 
+    def _check_id_existence(self, id):
+        """Check if a single id exists in the table."""
+        try:
+            response = self.table.get_item(Key={'id': id})
+            return (id, 'Item' in response)
+        except ClientError as e:
+            logger.error(f"Failed to check item with id {id}: {e}")
+            raise StorageException(f"Failed to check item existence with id {id}: {str(e)}")
+
     def _batch_write(self, items):
-        with self.table.batch_writer() as batch:
-            for item in items:
-                batch.put_item(Item=item)
-                logger.info(f"Inserted item with id {item['id']}")
+        """Write items in batches using ThreadPoolExecutor."""
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(self._write_item, item) for item in items]
+            for future in as_completed(futures):
+                try:
+                    future.result()  # This will re-raise any exceptions caught during the _write_item calls
+                except StorageException as e:
+                    logger.error(f"Batch write failed: {str(e)}")
+
+    def _write_item(self, item):
+        """Write a single item to the DynamoDB table."""
+        try:
+            self.table.put_item(Item=item)
+            logger.info(f"Inserted item with id {item['id']}")
+        except ClientError as e:
+            logger.error(f"Failed to insert item with id {item['id']}: {e}")
+            raise StorageException(f"Failed to insert item with id {item['id']}: {str(e)}")
 
 
 # Example usage of the StorageManager class
