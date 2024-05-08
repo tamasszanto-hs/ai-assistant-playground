@@ -26,7 +26,7 @@ class StorageManager:
         self.table = self.dynamodb.Table(table_name)
 
     def store_items(self, items):
-        """Store items in DynamoDB table if they are not already present.
+        """Efficiently store items in DynamoDB table if they are not already present.
 
         Args:
             items (list of dict): List containing key-value pairs to store.
@@ -34,19 +34,29 @@ class StorageManager:
         Raises:
             StorageException: If any error occurs during data storage.
         """
-        for item in items:
-            try:
-                # Check if the item already exists
-                response = self.table.get_item(Key={'id': item['id']})
-                if 'Item' not in response:
-                    # Item does not exist, proceed to insert
-                    self.table.put_item(Item=item)
+        try:
+            # Retrieve all existing IDs first to minimize writes
+            existing_ids = self._get_existing_ids([item['id'] for item in items])
+            new_items = [item for item in items if item['id'] not in existing_ids]
+
+            # Using batch_writer to handle batch operations
+            with self.table.batch_writer() as batch:
+                for item in new_items:
+                    batch.put_item(Item=item)
                     logger.info(f"Inserted item with id {item['id']}")
-                else:
-                    logger.debug(f"Item with id {item['id']} already exists.")
-            except ClientError as e:
-                logger.error(f"Failed to insert item with id {item['id']}: {e}")
-                raise StorageException(f"Failed to store item with id {item['id']}: {str(e)}")
+        except ClientError as e:
+            logger.error(f"Failed to insert items: {e}")
+            raise StorageException(f"Failed to store items: {str(e)}")
+
+    def _get_existing_ids(self, ids):
+        """Helper function to fetch existing item IDs in batch."""
+        existing_ids = set()
+        for id in ids:
+            response = self.table.get_item(Key={'id': id})
+            if 'Item' in response:
+                existing_ids.add(id)
+                logger.debug(f"Item with id {id} already exists.")
+        return existing_ids
 
 
 # Example usage of the StorageManager class
